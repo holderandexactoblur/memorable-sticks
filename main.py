@@ -1,11 +1,9 @@
-import requests
 import random
+import tls_client
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import time
 
-write_lock = threading.Lock()
-
+# Load proxies from proxies.txt
 def load_proxies():
     proxies = []
     try:
@@ -24,97 +22,81 @@ def load_proxies():
         print("proxies.txt not found. Using direct connection.")
     return proxies
 
-def get_random_proxy(proxies):
-    if proxies:
-        proxy_str = random.choice(proxies)
-        return {"http": proxy_str, "https": proxy_str}
-    return None
-
-def fetch_xsrf_token(proxies):
-    """Fetch the XSRF token from the kick.com homepage."""
-    url = "https://kick.com"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0"
-    }
-    try:
-        proxy = get_random_proxy(proxies)
-        response = requests.get(url, headers=headers, proxies=proxy, timeout=10)
-        if response.status_code == 200:
-            # Extract the XSRF-TOKEN from cookies
-            xsrf_token = response.cookies.get("XSRF-TOKEN")
-            if xsrf_token:
-                return xsrf_token
-            else:
-                print("XSRF-TOKEN not found in cookies.")
-        else:
-            print(f"Failed to fetch XSRF token: Status code {response.status_code}")
-    except Exception as e:
-        print(f"Error fetching XSRF token: {e}")
-    return None
-
-def check_username(username, proxies, xsrf_token, max_retries=3):
-    url = "https://kick.com/api/v1/signup/verify/username"
-    payload = {"username": username}
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36 Edg/133.0.0.0",
-        "Origin": "https://kick.com",
-        "Referer": "https://kick.com/",
-        "X-XSRF-TOKEN": xsrf_token,
-        "Sec-Ch-Ua": '"Not(A:Brand";v="99", "Microsoft Edge";v="133", "Chromium";v="133"',
-        "Sec-Ch-Ua-Mobile": "?0",
-        "Sec-Ch-Ua-Platform": '"Windows"',
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-origin"
-    }
-    
-    for _ in range(max_retries):
-        try:
-            proxy = get_random_proxy(proxies)
-            response = requests.post(url, json=payload, headers=headers, proxies=proxy, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                return data.get("taken", False)
-            elif response.status_code == 422:
-                print(f"[422] Unprocessable Content for username '{username}': {response.text}")
-                return None
-            else:
-                print(f"Username '{username}' returned unexpected status code: {response.status_code}")
-        except Exception as e:
-            print(f"Error checking username '{username}': {e}")
-            time.sleep(1)
-    return None
-
-def main():
-    proxies = load_proxies()
-    
+# Load usernames from usernames.txt
+def load_usernames():
     try:
         with open("usernames.txt", "r") as f:
-            usernames = [line.strip() for line in f if line.strip()]
+            return [line.strip() for line in f if line.strip()]
     except FileNotFoundError:
-        print("usernames.txt not found.")
-        return
+        print("usernames.txt not found. Exiting.")
+        exit()
 
-    # Fetch the XSRF token dynamically
-    xsrf_token = fetch_xsrf_token(proxies)
-    if not xsrf_token:
-        print("Failed to fetch XSRF token. Exiting.")
-        return
+# Get a random proxy
+def get_random_proxy(proxies):
+    if proxies:
+        return random.choice(proxies)
+    return None
 
-    with ThreadPoolExecutor(max_workers=90) as executor:
-        futures = {executor.submit(check_username, username, proxies, xsrf_token): username for username in usernames}
+# Check username availability
+def check_username(username, proxies):
+    proxy = get_random_proxy(proxies)
+    session = tls_client.Session(
+        client_identifier="chrome112",
+        random_tls_extension_order=True
+    )
+
+    # Set proxy if available
+    if proxy:
+        session.proxies = {"http": proxy, "https": proxy}
+
+    url = "https://kick.com/api/v1/signup/verify/username"
+    headers = {
+        "accept": "application/json",
+        "accept-encoding": "gzip",
+        "accept-language": "de_DE",
+        "connection": "Keep-Alive",
+        "content-type": "application/json",
+        "host": "kick.com",
+        "user-agent": "okhttp/4.9.2",
+        "x-kick-app-p-os": "android",
+        "x-kick-app-p-v": "28",
+        "x-kick-app-v": "1.0.43",
+    }
+
+    try:
+        response = session.post(
+            url,
+            headers=headers,
+            json={
+                "username": username,
+            },
+        )
+
+        # If the response is empty, the username is available
+        if not response.text:
+            print(f"Available username: {username}")
+            with threading.Lock():
+                with open("available.txt", "a") as file:
+                    file.write(username + "\n")
+        else:
+            print(f"Unavailable username: {username}")
+    except Exception as e:
+        print(f"Error checking username '{username}': {e}")
+
+# Main function
+def main():
+    proxies = load_proxies()
+    usernames = load_usernames()
+
+    # Use ThreadPoolExecutor for multi-threading
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        futures = {executor.submit(check_username, username, proxies): username for username in usernames}
         for future in as_completed(futures):
             username = futures[future]
-            result = future.result()
-            if result is None:
-                print(f"Failed to check username: {username}")
-            elif result:
-                print(f"Username '{username}' is taken.")
-            else:
-                print(f"Username '{username}' is available.")
-                with write_lock:
-                    with open("available.txt", "a") as out_file:
-                        out_file.write(username + "\n")
+            try:
+                future.result()  # Ensure any exceptions are raised
+            except Exception as e:
+                print(f"Error processing username '{username}': {e}")
 
 if __name__ == "__main__":
     main()
